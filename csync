@@ -1,0 +1,398 @@
+#!/bin/bash
+#-*- mode: shell-script; -*-
+
+function main {
+  
+  if [[ $# > 3 ]]; then
+    echo 'wrong number of arguments!'
+    usage
+  fi
+  
+  case $1 in
+  'help')
+    usage
+    ;;
+
+  'status')
+    config
+    get-owner
+    get-lock
+    ;;
+
+
+  'diff')    
+    config
+    if [ "${2}" != "" ]; then
+      
+      if [ -f "${2}" ]; then
+        diff_file $2
+      elif [ -d "${2}" ]; then
+        diff_subdir $2
+      else
+        echo "unsupported diff argument!: ${2}"
+        exit 1
+      fi
+    else
+      rsync_diff
+    fi
+    ;;
+  
+  'init')
+    parse_locations $2 $3
+    init
+    ;;
+
+  'push')
+    config
+    require-unlock
+    if [[ "$2" == "-nb" ]]; then
+      echo 'not backing up'
+    else
+      backup_remote
+    fi
+    push
+    ;;
+
+  'pull')
+    config
+    require-unlock
+    if [[ "$2" == "-nb" ]]; then
+      echo 'not backing up'
+    else
+      backup_local
+    fi
+    pull
+    ;;
+
+  'lock')
+    config
+    set-lock
+    ;;
+  
+  'unlock')
+    config
+    remove-lock
+    ;;
+
+  *)
+    usage
+    ;;
+esac
+  
+}
+
+function parse_locations {
+  remote=$1
+  local=$2
+
+  if grep -q '~' <<< "${remote}"; then
+    echo "Tilde expansion isn't supported by ssh, use the full path..."
+    exit 1
+  fi
+
+  if grep -q '~' <<< "${local}"; then
+    echo "Tilde expansion isn't supported by ssh, use the full path..."
+    exit 1
+  fi
+  
+  arr=(${remote//:/ })
+  
+  if [[ ${#arr[@]} != 2 ]]; then
+    echo "couldn't parse ${remote} into host / dir ${arr}"
+    exit 1
+  fi
+
+  remote_host=${arr[0]}
+  remote_dir=${arr[1]}
+
+  arr=(${local//:/ })
+  
+  if [[ ${#arr[@]} != 2 ]]; then
+    echo "couldn't parse ${local} into host / dir ${arr}"
+    exit 1
+  fi
+  
+  local_host=${arr[0]}
+  local_dir=${arr[1]}
+
+}
+
+function usage {
+  echo ""
+  echo "usage:"
+  echo "csync init remote local (e.g. user@host:/dir user@host:/dir)"
+  echo "..."
+  echo "csync [push|pull|status|diff]"
+  echo ""
+  exit 1
+}
+
+function init {
+  mkdir -p .csync
+  touch .csync/rsync-excludes
+  touch .csync/rsync-includes
+  csync_project_name=${PWD##*/}
+
+  # local init
+  if ! [ -f .csync/config.sh ]; then
+      cat << EOF > .csync/config.sh
+csync_project_name=${csync_project_name}
+csync_local_backup_dir=${local_dir}/.csync/backups
+csync_remote_backup_dir=${remote_dir}/.csync/backups
+csync_remote=${remote}
+csync_local=${local}
+EOF
+      echo "created .csync/config.sh"
+  else
+    echo "local .csync/config.sh already exists!"
+  fi
+
+  # remote init
+  if ! ssh ${remote_host}  "[ -d  ${remote_dir}/.csync ]"; then
+    ssh ${remote_host} "mkdir -p ${remote_dir}/.csync"
+    ssh ${remote_host} "echo csync_project_name=${csync_project_name} > ${remote_dir}/.csync/config.sh"
+    ssh ${remote_host} "echo csync_local_backup_dir=${remote_dir}/.csync/backups >> ${remote_dir}/.csync/config.sh"
+    ssh ${remote_host} "echo csync_remote_backup_dir=${local_dir}/.csync/backups >> ${remote_dir}/.csync/config.sh"
+    ssh ${remote_host} "echo csync_remote=${local} >> ${remote_dir}/.csync/config.sh"
+    ssh ${remote_host} "echo csync_local=${remote} >> ${remote_dir}/.csync/config.sh"
+    ssh ${remote_host} "touch ${remote_dir}/.csync/rsync-excludes"
+    ssh ${remote_host} "touch ${remote_dir}/.csync/rsync-includes"
+    echo "created $remote/.csync/config"
+  else
+    echo "remote .csync/config.sh already exists!"
+  fi
+  echo "init complete, edit accordingly"
+  exit
+}
+
+function config {
+  if ! [ -f .csync/config.sh ]; then
+      echo 'run init first!'
+      exit 1
+  fi
+  source .csync/config.sh
+  # used stored remote
+  parse_locations ${csync_remote} ${csync_local}
+
+}
+
+function create_path_and_file {
+    arg=$1
+    num_of_dirs=$(grep -o "/" <<< $arg | wc -l)
+    dirs_no_whitespace="$(echo -e "${num_of_dirs}" | tr -d '[:space:]')"
+    make_dirs=$(echo $arg | cut -d / -f1-$dirs_no_whitespace)
+    mkdir -p $make_dirs && touch $arg
+}
+
+function diff_file {  
+  file=$1
+  #install -D /dev/null /tmp/${file}  # doesn't work on osx
+  create_path_and_file /tmp/$file
+  scp ${remote}/$file /tmp/${file}
+  diff $file /tmp/$file
+}
+
+function diff_subdir {
+  dir=$1
+  if ! ssh ${remote_host}  "[ -d  ${remote_dir}/${1} ]"; then
+    echo "directory ${remote_dir}/${1} doesn't exist on ${remote_host}"
+    exit
+  fi
+  echo "performing dry-run pull"
+  rsync -av --delete --dry-run \
+        --exclude=.csync \
+        --include-from=./.csync/rsync-includes \
+        --exclude-from=./.csync/rsync-excludes \
+        ${remote}/$1 ./$1
+
+  # https://unix.stackexchange.com/questions/57305/rsync-compare-directories
+  rsync -ri --dry-run --exclude=.csync \
+        --include-from=./.csync/rsync-includes \
+        --exclude-from=./.csync/rsync-excludes \
+        --ignore-existing ./$1 ${remote}/$1 | sed -e 's/^[^ ]* /L             /'
+  rsync -ri --dry-run --exclude=.csync \
+        --include-from=./.csync/rsync-includes \
+        --exclude-from=./.csync/rsync-excludes \
+        --ignore-existing ${remote}/$1 ./$1 | sed -e 's/^[^ ]* /R             /'
+  rsync -ri --dry-run --exclude=.csync \
+        --include-from=./.csync/rsync-includes \
+        --exclude-from=./.csync/rsync-excludes \
+        --existing ./$1 ${remote}/$1 |sed -e 's/^/X /'
+
+   echo ""
+  echo "------------------------help------------------------------------"
+  echo "L/R mean that the file/dir appears only at the Left or Right dir."
+  echo "X means that the file appears on both sides but is not the same "
+  echo "(in which case the next 11 characters give you more info. "
+  echo "s,t and p depict differences in size, time and permissions respectively"
+  echo "-- for more info try man rsync and search for --itemize-changes)."
+
+}
+
+function rsync_diff {
+  echo "performing dry-run pull"
+  rsync -av --delete --dry-run \
+        --exclude=.csync \
+        --include-from=./.csync/rsync-includes \
+        --exclude-from=./.csync/rsync-excludes \
+        ${remote}/ ./
+
+  # https://unix.stackexchange.com/questions/57305/rsync-compare-directories
+  rsync -ri --dry-run --exclude=.csync \
+        --include-from=./.csync/rsync-includes \
+        --exclude-from=./.csync/rsync-excludes \
+        --ignore-existing ./ ${remote}/ | sed -e 's/^[^ ]* /L             /'
+  rsync -ri --dry-run --exclude=.csync \
+        --include-from=./.csync/rsync-includes \
+        --exclude-from=./.csync/rsync-excludes \
+        --ignore-existing ${remote}/ ./ | sed -e 's/^[^ ]* /R             /'
+  rsync -ri --dry-run --exclude=.csync \
+        --include-from=./.csync/rsync-includes \
+        --exclude-from=./.csync/rsync-excludes \
+        --existing ./ ${remote}/ |sed -e 's/^/X /'
+
+  
+  
+  echo ""
+  echo "------------------------help------------------------------------"
+  echo "L/R mean that the file/dir appears only at the Left or Right dir."
+  echo "X means that the file appears on both sides but is not the same "
+  echo "(in which case the next 11 characters give you more info. "
+  echo "s,t and p depict differences in size, time and permissions respectively"
+  echo "-- for more info try man rsync and search for --itemize-changes)."
+
+  
+  exit
+}
+
+function pull {
+
+
+  
+  
+  echo "pulling"
+  rsync -av --delete \
+        --ignore-errors \
+        --exclude=.csync/config.sh \
+        --exclude=.csync/backups \
+        --include-from=./.csync/rsync-includes \
+        --exclude-from=./.csync/rsync-excludes \
+        ${remote}/ ./
+  set-owner ${USER}@${HOSTNAME}
+  echo "complete"
+  echo ""
+}
+
+
+function push {
+
+  # verify remote dir exists
+  if ! ssh ${remote_host}  "[ -d  ${remote_dir} ]"; then
+    echo "remote directory  ${remote} doesn't exist!"
+    exit 1
+  fi  
+
+  echo "pushing"
+  rsync -av --delete \
+        --exclude=.csync/config.sh \
+        --exclude=.csync/backups \
+        --include-from=./.csync/rsync-includes \
+        --exclude-from=./.csync/rsync-excludes \
+        ./ ${remote}
+  set-owner $remote_host
+  echo "complete"
+  echo ""
+}
+
+function set-owner {
+  echo setting owner $1
+  ssh ${remote_host} "echo ${1} > ${remote_dir}/.csync/owner"
+  echo ${1} > ./.csync/owner
+}
+
+function get-owner {
+  r_owner=$( ssh ${remote_host} "cat ${remote_dir}/.csync/owner" )
+  owner=$(cat ./.csync/owner)
+  echo local:$owner remote:$r_owner
+}
+
+function set-lock {
+  echo setting lock
+  ssh ${remote_host} "echo '' > ${remote_dir}/.csync/lock"
+  echo '' > ./.csync/lock
+}
+
+function get-lock {
+  if ssh ${remote_host}  "[ -e  ${remote_dir}/.csync/lock ]"; then
+    echo 'locked: true'
+    return
+  fi
+  if [ -e  .csync/lock ]; then
+    echo 'locked: true'
+    return
+  fi
+  echo 'locked: false'
+}
+
+function remove-lock {
+  echo removing lock
+  ssh ${remote_host} rm ${remote_dir}/.csync/lock
+  rm .csync/lock
+}
+
+function require-unlock {
+  
+  if ssh ${remote_host}  "[ -e  ${remote_dir}/.csync/lock ]"; then
+    echo 'csync is locked! manually merge and unlock to proceed...!'
+    exit
+  fi
+  
+  if [ -e  .csync/lock ]; then
+    echo 'csync is locked! manually merge and unlock to proceed...!'
+    exit
+  fi
+
+}
+
+function backup_local {
+  echo "backing up local"
+  mkdir -p ${csync_local_backup_dir}/${csync_project_name}
+  date=`date "+%Y-%m-%dT%H:%M:%S"`
+  rsync -av \
+        --ignore-errors \
+        --exclude-from=.csync/rsync-excludes \
+        --exclude=.csync/backups \
+        --link-dest=${csync_local_backup_dir}/${csync_project_name}/current \
+        ./ \
+        ${csync_local_backup_dir}/${csync_project_name}/back-$date/
+
+  rm -f ${csync_local_backup_dir}/${csync_project_name}/current
+  ln -s ${csync_local_backup_dir}/${csync_project_name}/back-$date ${csync_local_backup_dir}/${csync_project_name}/current
+  echo "backup complete"
+  echo ""
+}
+
+function backup_remote {
+  # verify remote dir exists
+  if ! ssh ${remote_host}  "[ -d  ${remote_dir} ]"; then
+    echo "remote directory  ${remote} doesn't exist!"
+    exit 1
+  fi  
+
+  echo "backing up remote"
+  ssh ${remote_host} mkdir -p ${csync_remote_backup_dir}/${csync_project_name}
+  date=`date "+%Y-%m-%dT%H:%M:%S"`
+  ssh ${remote_host} rsync -av \
+      --exclude-from=${remote_dir}/.csync/rsync-excludes \
+      --exclude=.csync/backups \
+      --link-dest=${csync_remote_backup_dir}/${csync_project_name}/current \
+        ${remote_dir}/ \
+        ${csync_remote_backup_dir}/${csync_project_name}/back-$date/
+
+  ssh ${remote_host} rm -f ${csync_remote_backup_dir}/${csync_project_name}/current
+  ssh ${remote_host} ln -s ${csync_remote_backup_dir}/${csync_project_name}/back-$date ${csync_remote_backup_dir}/${csync_project_name}/current
+  echo "backup complete"
+  echo ""
+}
+
+main $@
